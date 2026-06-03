@@ -1,0 +1,321 @@
+# Birthday Trivia Party — Design Document
+
+A self-hosted, real-time multiplayer trivia game for a birthday party. Front-end heavy, mobile-first, lots of animation. One admin runs the show from their phone/laptop; guests join from their phones by typing a name.
+
+This document is the spec. Build it incrementally per the **Build Order** at the bottom. Where something is marked **DECISION** I've picked a default — flag it if you'd choose differently rather than silently changing it.
+
+---
+
+## 1. Goal & Scope
+
+A single-session party game played in one room over shared/mobile wifi. Expected scale: **2–30 players**. It runs once per party; it does not need accounts, persistence across parties, or production hardening. It _does_ need to feel polished and lively, and it needs to survive phones locking and browsers reloading mid-game (very common at a party).
+
+**In scope:** lobby, live synchronized questions, answer submission + locking, reveal with scoring, live top-5 leaderboard, final results screen with confetti and a bottom-3 "take a shot" tease, an optional admin question editor.
+
+**Out of scope:** multiple concurrent games/rooms, persistent user accounts, payment, analytics, internationalization, automated tests beyond basic sanity.
+
+---
+
+## 2. Key Decisions & Assumptions
+
+- **DECISION — Real-time transport: Socket.IO over a custom Next.js server.** The game is admin-driven and everyone must move in lockstep, so we need server-pushed state. Socket.IO is chosen over SSE/polling specifically because it auto-reconnects, which matters when party guests' phones sleep and wake. The whole game runs in **one Node process** (Next.js + Socket.IO + the game engine).
+- **DECISION — Authoritative game state lives in memory** on the server (a single game-engine object). Postgres is used _only_ for durable facts (players, answers) and one tiny crash-recovery row. Clients never decide correctness or scores — the server does.
+- **DECISION — Questions live in `content/questions.mdx`** as the single source of truth. The baseline workflow is "edit the MDX file before the party." The admin web editor (Section 11) is an _optional_ nice-to-have that appends to that same file.
+- **DECISION — No per-question countdown timer.** The admin manually locks answers when ready, matching the described flow. A visible timer is listed as an optional enhancement only.
+- **Assumption:** the app is self-hosted (run on the host's laptop or a small VPS) where the server has filesystem write access. This is what makes the optional MDX editor feasible.
+- **Assumption:** "front-end heavy" means the _complexity and polish_ live in the UI; the backend is a thin state machine, not that there's no backend.
+
+---
+
+## 3. Tech Stack
+
+- **Next.js (App Router) + TypeScript** — UI and routing.
+- **Custom server (`server.ts`/`server.js`)** — boots Next.js and attaches Socket.IO to the same HTTP server.
+- **Socket.IO** — real-time events (client + server).
+- **Tailwind CSS** — mobile-first styling.
+- **Framer Motion** — transitions, layout animations (leaderboard rank changes), entrances.
+- **canvas-confetti** — final-screen confetti.
+- **lucide-react** — icons (crown/star, lock, check, etc.).
+- **Postgres**, accessed via **`postgres` (postgres.js)** or **Drizzle** — keep it light; no heavy ORM required. **DECISION: postgres.js** for minimal footprint; raw SQL in `db/schema.sql`.
+- **MDX** via `@next/mdx` (configured to allow ESM named exports) so the questions file can `export const questions = [...]`.
+
+---
+
+## 4. Roles & Auth
+
+Two roles, both party-grade (not security-critical), but **the server is the source of truth for correctness so techy guests can't cheat by inspecting traffic**.
+
+- **Player** — joins from the lobby by entering a display name. Gets a `playerId` (server-generated, e.g. nanoid) stored in `localStorage` for reconnection.
+- **Admin** — enters the app password on the lobby screen. Password lives in `ADMIN_PASSWORD` (env). On success the server marks that socket as admin and the client stores an admin flag in `localStorage` so a refresh re-elevates after re-sending the password (don't trust the client flag alone — re-verify the password on reconnect, or set a short signed cookie).
+
+Security notes that matter even for a party:
+
+- The question payload sent during the active phase **must not include the correct answer index**. The server only emits `correctIndex` at reveal time.
+- The client sends only its selected option index; the server computes `is_correct`, `points`, and the leaderboard.
+- Multiple admin devices are allowed but discouraged; server actions are idempotent and last-writer-wins. Recommend a single admin device.
+
+---
+
+## 5. Data Model
+
+### 5.1 Questions — `content/questions.mdx` (source of truth)
+
+MDX file that exports a typed array. Markdown below the export is human-only and ignored by the app.
+
+```mdx
+export const questions = [
+  {
+    id: "q1",
+    prompt: "Which planet is known as the Red Planet?",
+    options: ["Venus", "Mars", "Jupiter", "Saturn"],
+    answer: 1, // index into options of the correct answer
+    category: "Science", // optional, for grouping/labels
+  },
+  {
+    id: "q2",
+    prompt: "What year did the birthday person graduate? 🎓",
+    options: ["2008", "2010", "2012", "2014"],
+    answer: 2,
+  },
+];
+
+# Birthday Trivia Questions
+
+Edit the array above to add/remove questions. `answer` is the 0-based index of
+the correct option. Keep `id` values unique and stable.
+```
+
+The server imports `{ questions }` at startup and validates it (unique ids, exactly 4 options recommended but allow 2–4, `answer` in range). On validation failure, refuse to start and log which question is malformed.
+
+### 5.2 Postgres (kept deliberately light)
+
+```sql
+-- players who joined this session
+create table players (
+  id          text primary key,          -- nanoid, also stored client-side
+  name        text not null,
+  created_at  timestamptz not null default now()
+);
+
+-- one row per (player, question); server-computed truth
+create table responses (
+  id           bigserial primary key,
+  player_id    text not null references players(id),
+  question_id  text not null,
+  selected_idx int  not null,
+  is_correct   boolean not null,
+  elapsed_ms   int  not null,            -- from question shown to submit
+  points       int  not null,
+  created_at   timestamptz not null default now(),
+  unique (player_id, question_id)        -- one answer per question, no resubmits
+);
+
+-- OPTIONAL but recommended: single-row crash recovery so a server
+-- restart mid-party can resume the current question/phase.
+create table game_state (
+  id            int primary key default 1,
+  phase         text not null default 'LOBBY',
+  current_index int  not null default 0,
+  updated_at    timestamptz not null default now()
+);
+```
+
+The **leaderboard is derived**, never stored: `SELECT player_id, SUM(points) total, COUNT(*) FILTER (WHERE is_correct) corrects, SUM(elapsed_ms) time FROM responses GROUP BY player_id`. Tie-break: total points desc, then corrects desc, then total time asc.
+
+---
+
+## 6. Game State Machine
+
+A single global phase plus a current question index. The admin drives every transition.
+
+| Phase             | What players see / can do                                    | What admin sees / can do                                                                                    |
+| ----------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `LOBBY`           | Enter name, see live list of who's joined                    | Auth, see joiners, **Start Game** (disabled if 0 players)                                                   |
+| `QUESTION_ACTIVE` | Question + options; select then **Confirm**; then "waiting"  | Question, **live submitted count**, always-visible **Lock** button (this is the "Next" in your description) |
+| `LOCKED`          | Options disabled; un-submitted players are locked out at 0   | **Show Answer** button                                                                                      |
+| `REVEALED`        | Correct option highlighted; who got it right; top-5 board    | **Next Question** (or **Finish** on last question)                                                          |
+| `FINISHED`        | Full leaderboard popup, confetti, winner star, bottom-3 dare | Same view; optionally **Play Again** (resets state + DB)                                                    |
+
+Transitions (admin-triggered): `LOBBY →(start)→ QUESTION_ACTIVE →(lock)→ LOCKED →(reveal)→ REVEALED →(next)→ QUESTION_ACTIVE | FINISHED`.
+
+Notes:
+
+- The three admin actions during a round are deliberately distinct and clearly labeled: **Lock** (stop answers), **Show Answer** (reveal), **Next Question** (advance). Your description called the lock step "Next" — renamed for clarity; keep these labels in the UI.
+- When **all** connected players have submitted, visually emphasize the **Lock** button (e.g. pulse) so the admin knows it's safe to advance. Optional toggle: auto-lock when everyone's in.
+- On `REVEALED`, the server computes correctness + points and persists each response, then emits the updated leaderboard.
+
+---
+
+## 7. Real-Time Event Contract (Socket.IO)
+
+Sanitize aggressively: never leak `answer` before reveal.
+
+**Client → Server**
+
+- `player:join { name }` → `{ playerId }`; broadcast `lobby:update`
+- `player:rejoin { playerId }` → re-attach existing player; send current `game:state`
+- `admin:auth { password }` → `{ ok: boolean }`; if ok, mark socket admin
+- `admin:startGame` → phase `QUESTION_ACTIVE`, index 0
+- `player:submitAnswer { questionId, selectedIdx }` → record (server stamps `elapsed_ms`); broadcast submission count
+- `admin:lock` → phase `LOCKED`
+- `admin:reveal` → compute + persist + phase `REVEALED`
+- `admin:nextQuestion` → next index `QUESTION_ACTIVE`, or phase `FINISHED` if last
+- `admin:playAgain` → reset in-memory state + truncate `responses` (keep or clear players — **DECISION: keep players**)
+- `admin:addQuestion { ... }` _(optional, Section 11)_
+
+**Server → Client (broadcast unless noted)**
+
+- `lobby:update { players: [{ id, name }] }`
+- `game:state { phase, currentIndex, totalQuestions, question }` — `question` is `{ id, prompt, options, category }` **with no answer field** during active/locked phases
+- `game:submissionUpdate { count, totalPlayers, submittedIds }` — `submittedIds` to **admin only**; players get just the count
+- `game:reveal { correctIdx, correctPlayerIds, leaderboardTop5 }`
+- `game:finished { leaderboardFull }` — every player with rank, score, corrects
+- `error { message }`
+
+Every newly connected socket should immediately receive `game:state` (and `lobby:update` if in lobby) so reconnects land in the right screen.
+
+---
+
+## 8. Pages & UI
+
+All mobile-first: single column, large tap targets, thumb-reachable primary buttons, sticky top-5 leaderboard peek during the game.
+
+1. **`/` — Lobby**
+   - Name entry → join. Below: animated live list of joined players (names pop in with a spring/scale via Framer Motion).
+   - Small "Admin" affordance → password field. On success, admin sees the **Start Game** button (disabled with 0 players).
+   - If a player already has a `playerId` in `localStorage`, auto-rejoin.
+
+2. **`/game` — Game (one route, role-aware view)**
+   - **Question card:** prompt + 4 large option buttons.
+   - **Player flow:** tap to select (highlight), then **Confirm** (the selection locks in; can't change after confirm). Then a calm "waiting for others…" state. When locked without having submitted: options visibly disabled/greyed with a subtle shake, no points.
+   - **Admin controls bar (sticky bottom):** live `submitted X / Y`, the phase-appropriate button (**Lock** → **Show Answer** → **Next Question / Finish**).
+   - **Reveal:** correct option glows green, wrong selections red; a list/badges of players who got it right; top-5 leaderboard animates rank changes.
+   - **Top-5 leaderboard** is visible (peekable) throughout the game, not just on reveal.
+
+3. **`/admin/questions` — Question Manager (optional, Section 11)**
+   - Table/list of questions: prompt, options, marked correct answer, category.
+   - Add-question form (prompt, 4 options, pick correct). On submit, append to `questions.mdx` and hot-reload the in-memory list.
+
+4. **Final results — modal/overlay on `/game` at `FINISHED`**
+   - Full ranked leaderboard in a popup.
+   - ⭐ / 👑 on the winner (handle ties → multiple winners).
+   - **Confetti** burst (canvas-confetti) on mount.
+   - **Bottom-3 tease:** a playful callout — e.g. "Bottom 3, you know the rules… 🥃 take a shot!" with a wobble/spotlight animation on those names.
+
+---
+
+## 9. Scoring & Leaderboard
+
+Server-computed only. Per question:
+
+```
+points = is_correct ? (1000 + speedBonus) : 0
+speedBonus = max(0, round(500 - (elapsed_ms / 1000) * 25))   // ~0 after 20s
+```
+
+`elapsed_ms` = time from when the server moved into `QUESTION_ACTIVE` to the player's submit. The speed bonus keeps the leaderboard from being a wall of ties and rewards quick answers without needing a visible timer. Constants are tunable; expose them in one place (`lib/scoring.ts`).
+
+- **Top-5** shown live during the game; **full** list at the end.
+- **Tie-break:** total points → correct count → total elapsed time (faster wins).
+- Ties at rank 1 → all tied players get the winner star.
+
+---
+
+## 10. UX, Mobile-First & Animation Spec
+
+- **Lobby:** player names enter with spring/scale; gentle ambient motion so an empty-ish lobby still feels alive.
+- **Question entrance:** slide/fade in; options stagger in.
+- **Select:** scale + border highlight; **Confirm:** quick pulse + lock-in.
+- **Locked (no submit):** subtle shake + dim.
+- **Reveal:** correct option green glow, incorrect selections red; small confetti or check-burst for players who were right.
+- **Leaderboard:** Framer Motion `layout` animation so rows physically slide as ranks change between rounds.
+- **Finish:** full-screen confetti, winner star/crown pop, bottom-3 wobble/spotlight.
+- **Touch:** primary actions ≥ 44px tall, bottom-anchored; avoid hover-only affordances.
+- **Reduced motion:** respect `prefers-reduced-motion` (skip big animations, keep functionality).
+
+---
+
+## 11. Optional — Admin Question Editor
+
+Lower priority; build last. `/admin/questions` lists questions and offers an add form. On submit, a server action appends the new object to `content/questions.mdx` (filesystem write — only works self-hosted, which is our assumption) and reloads the in-memory questions array. Validate before writing (4 options, valid `answer` index, unique id). **Caveat to surface in the README:** this won't work on read-only/serverless hosting; in that case edit the MDX file directly. If filesystem writes prove fragile, the fallback is a `questions` DB table merged with the MDX list — but prefer MDX to honor the single-source-of-truth decision.
+
+---
+
+## 12. Reconnection & Edge Cases
+
+- **Player refresh / phone sleep:** `localStorage.playerId` → `player:rejoin` → server re-attaches and sends current `game:state`. Already-submitted answers persist.
+- **Admin refresh:** re-send password on reconnect (or short signed cookie) to re-elevate; game state survives in memory + the `game_state` row.
+- **Server restart mid-party:** rebuild players + scores from `players`/`responses`; resume phase/index from `game_state`. (This is the whole reason `game_state` exists.)
+- **Late joiner after Start — DECISION:** joining is open only in `LOBBY`. After start, a _new_ name is blocked with "Game already in progress." Existing players can always rejoin.
+- **Duplicate names — DECISION:** allow, but if an exact name already exists append a short suffix (e.g. "Sam", "Sam (2)").
+- **Disconnected, un-submitted player at Lock:** scored 0 for that question.
+- **No players / empty question set:** guard — Start disabled with 0 players; refuse boot with 0 questions.
+
+---
+
+## 13. Project Structure
+
+```
+trivia-party/
+├── server.ts                  # boots Next + Socket.IO + game engine
+├── src/
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx           # Lobby
+│   │   ├── game/page.tsx      # Game (role-aware)
+│   │   └── admin/questions/page.tsx   # optional editor
+│   ├── components/
+│   │   ├── lobby/PlayerList.tsx, JoinForm.tsx, AdminGate.tsx
+│   │   ├── game/QuestionCard.tsx, OptionButton.tsx, AdminControls.tsx, WaitingState.tsx
+│   │   ├── leaderboard/Leaderboard.tsx (top5 + full)
+│   │   └── results/FinalResults.tsx, Confetti.tsx, BottomThreeDare.tsx
+│   ├── lib/
+│   │   ├── socketClient.ts    # client singleton + React hooks
+│   │   ├── gameEngine.ts      # server state machine (the "brain")
+│   │   ├── events.ts          # shared event name + payload types
+│   │   ├── questions.ts       # MDX loader + validation
+│   │   ├── scoring.ts         # points/speed-bonus constants + fn
+│   │   └── db.ts              # postgres.js client + queries
+│   └── content/
+│       └── questions.mdx
+├── db/schema.sql
+├── .env.example
+├── next.config.mjs            # MDX config allowing ESM exports
+├── package.json
+└── README.md
+```
+
+Keep the Socket.IO **event names and payload types in one shared `lib/events.ts`** imported by both client and server so the contract can't drift.
+
+---
+
+## 14. Environment Variables
+
+```
+ADMIN_PASSWORD=change-me
+DATABASE_URL=postgres://user:pass@localhost:5432/trivia
+PORT=3000
+# optional scoring overrides
+SCORE_BASE=1000
+SCORE_MAX_SPEED_BONUS=500
+```
+
+Ship a `.env.example`. README should cover: create DB, run `db/schema.sql`, set env, `npm run dev`.
+
+---
+
+## 15. Build Order (do this incrementally; verify each step)
+
+1. **Scaffold:** Next.js + TS + Tailwind + custom `server.ts` with Socket.IO handshake; postgres.js connecting; run `schema.sql`. Prove a round-trip socket echo and a DB query.
+2. **Questions:** `questions.mdx` + loader + validation + shared `events.ts` types.
+3. **Lobby:** player join (name → playerId → localStorage), admin auth, live `lobby:update` list, Start button.
+4. **Game engine:** the server state machine + full event contract (no UI polish yet).
+5. **Game screen — player:** question render, select + Confirm, submit, waiting + locked states.
+6. **Game screen — admin:** live submitted count, Lock → Show Answer → Next/Finish; reveal highlighting + who-got-it-right.
+7. **Scoring + leaderboard:** server scoring, persist responses, live top-5 with animated rank changes.
+8. **Final results:** full leaderboard popup, winner star (ties handled), confetti, bottom-3 dare.
+9. **Reconnection:** player rejoin, admin re-elevate, server-restart recovery via `game_state`.
+10. **Polish pass:** Framer Motion transitions, mobile-first spacing/tap targets, reduced-motion.
+11. **Optional:** `/admin/questions` editor appending to MDX.
+
+Stop and confirm with the user before deviating from any **DECISION** above.

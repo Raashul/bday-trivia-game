@@ -1,65 +1,149 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { motion, AnimatePresence } from 'framer-motion';
+import { getSocket } from '@/lib/socketClient';
+
+export default function HomePage() {
+  const router = useRouter();
+  const socket = getSocket();
+
+  const [password, setPassword] = useState('');
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [gameCode, setGameCode] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    const stored = localStorage.getItem('adminPassword');
+    if (stored) {
+      socket.emit('admin:auth', { password: stored }, ({ ok }) => {
+        if (ok) setIsAdmin(true);
+      });
+    }
+  }, []);
+
+  function handleAuth(e: React.FormEvent) {
+    e.preventDefault();
+    setAuthError('');
+    socket.emit('admin:auth', { password }, ({ ok }) => {
+      if (ok) {
+        localStorage.setItem('isAdmin', 'true');
+        localStorage.setItem('adminPassword', password);
+        setIsAdmin(true);
+      } else {
+        setAuthError('Wrong password');
+      }
+    });
+  }
+
+  function handleCreateGame() {
+    setCreating(true);
+    socket.emit('admin:createGame', ({ code }) => {
+      setGameCode(code);
+      setCreating(false);
+    });
+  }
+
+  function handleGoToLobby() {
+    if (gameCode) router.push(`/game/${gameCode}`);
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+    <div className="flex min-h-screen flex-col items-center justify-center px-4">
+      <motion.div
+        initial={{ opacity: 0, y: -16 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="mb-10 text-center"
+      >
+        <div className="text-5xl mb-2">🎂</div>
+        <h1 className="text-4xl font-bold tracking-tight bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
+          Birthday Trivia
+        </h1>
+        <p className="text-white/40 text-sm mt-1">Host control panel</p>
+      </motion.div>
+
+      <div className="w-full max-w-sm space-y-6">
+        <AnimatePresence mode="wait">
+          {!isAdmin ? (
+            <motion.form
+              key="auth"
+              onSubmit={handleAuth}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="space-y-3"
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+              <input
+                type="password"
+                placeholder="Host password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full rounded-xl bg-white/10 border border-white/20 px-4 py-3 text-white placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-purple-500 text-base"
+              />
+              {authError && <p className="text-red-400 text-sm">{authError}</p>}
+              <button
+                type="submit"
+                disabled={!password}
+                className="w-full rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 font-semibold text-white transition-colors min-h-[44px]"
+              >
+                Login as Host
+              </button>
+            </motion.form>
+          ) : !gameCode ? (
+            <motion.div
+              key="create"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="space-y-3"
             >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+              <p className="text-white/50 text-sm text-center">Ready to host a game?</p>
+              <button
+                onClick={handleCreateGame}
+                disabled={creating}
+                className="w-full rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 disabled:opacity-40 py-4 font-bold text-lg text-white transition-all min-h-[56px] shadow-lg shadow-purple-900/40"
+              >
+                {creating ? 'Creating…' : 'Create Game 🎉'}
+              </button>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="code"
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="space-y-6 text-center"
+            >
+              <div>
+                <p className="text-white/50 text-sm mb-3">Share this code with your players</p>
+                <div className="flex justify-center gap-3">
+                  {gameCode.split('').map((letter, i) => (
+                    <motion.div
+                      key={i}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: i * 0.1 }}
+                      className="w-20 h-24 rounded-2xl bg-gradient-to-b from-purple-600 to-purple-800 border border-purple-500/40 flex items-center justify-center text-5xl font-black tracking-widest shadow-lg shadow-purple-900/50"
+                    >
+                      {letter}
+                    </motion.div>
+                  ))}
+                </div>
+                <p className="text-white/30 text-xs mt-3">
+                  Players join at <span className="text-white/60 font-mono">/game/{gameCode}</span>
+                </p>
+              </div>
+              <button
+                onClick={handleGoToLobby}
+                className="w-full rounded-xl bg-white/10 hover:bg-white/20 border border-white/20 py-4 font-semibold text-white transition-colors min-h-[56px]"
+              >
+                Go to Lobby →
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
