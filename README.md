@@ -1,36 +1,92 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Birthday Trivia Party
 
-## Getting Started
+A real-time multiplayer trivia game designed for parties. The host controls the pace from one screen while players join and answer on their own devices — no app install needed.
 
-First, run the development server:
+## How it works
+
+1. The host logs in at `/` with a password and creates a game room
+2. A 3-letter code is displayed — players go to `/game/<CODE>` on their phones and enter their name
+3. The host starts the game, and questions appear on everyone's screen simultaneously
+4. Players pick an answer and tap **Confirm**; the host sees how many have submitted
+5. Host clicks **Lock Answers**, then **Show Answer** to reveal the correct option and update the leaderboard
+6. Repeat until all questions are done — final results show rankings (and the bottom 3)
+
+## Tech stack
+
+- **Next.js 16** (App Router) + **React 19**
+- **Socket.IO 4** for real-time events
+- **PostgreSQL** via postgres.js for questions and score persistence
+- **Tailwind CSS 4** + **Framer Motion** for UI
+- Single Node.js process serves both the Next.js app and the Socket.IO server (`server.ts`)
+
+## Setup
+
+### 1. Database
+
+Create a Postgres database and run the schema:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+psql $DATABASE_URL -f db/schema.sql
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+> **Note:** Also create the `games` table manually — it's referenced in the app but currently missing from `schema.sql`:
+> ```sql
+> CREATE TABLE IF NOT EXISTS games (
+>   code        text primary key,
+>   status      text not null default 'active',
+>   created_at  timestamptz not null default now(),
+>   finished_at timestamptz
+> );
+> ```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 2. Environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Copy `.env.example` to `.env.local` and fill in your values:
 
-## Learn More
+```bash
+cp .env.example .env.local
+```
 
-To learn more about Next.js, take a look at the following resources:
+```
+ADMIN_PASSWORD=your-secret-password
+DATABASE_URL=postgres://user:pass@localhost:5432/trivia
+PORT=3000
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### 3. Install & run
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm install
+npm run dev     # development
+npm run build && npm start  # production
+```
 
-## Deploy on Vercel
+## Adding questions
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Use the REST API (requires your admin password in the header):
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+curl -X POST http://localhost:3000/api/questions \
+  -H "Content-Type: application/json" \
+  -H "x-admin-password: your-secret-password" \
+  -d '{
+    "prompt": "What year was the birthday person born?",
+    "options": ["1994", "1995", "1996", "1997"],
+    "answer": 1,
+    "category": "About the Birthday Person"
+  }'
+```
+
+- `options` — array of 2–4 strings
+- `answer` — 0-based index of the correct option
+- `category` — optional label shown on the question card
+
+## Scoring
+
+Each correct answer is worth **1000 points**. No time bonus. The host controls the pace manually, so there's no countdown timer.
+
+## Notes
+
+- Only one game can be active at a time. Starting a new game ends the previous one.
+- Game state (current question, submissions, player list) is in-memory — a server restart mid-game will lose live state. Questions and historical scores are persisted in Postgres.
+- Players store their ID in `localStorage` and rejoin automatically on page refresh.
