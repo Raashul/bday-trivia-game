@@ -104,8 +104,12 @@ export const db = {
     const rows = await sql`
       SELECT id, prompt, options, answer, category
       FROM questions
-      ORDER BY created_at ASC
     `;
-    return rows as unknown as QuestionRecord[];
+    const questions = rows as unknown as QuestionRecord[];
+    for (let i = questions.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [questions[i], questions[j]] = [questions[j], questions[i]];
+    }
+    return questions;
   },
 };
